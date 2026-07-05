@@ -3,3 +3,9 @@ packages:
   - 'text'
   - 'desktop'
   - 'goose-binary/*'
+nodeLinker: hoisted
+allowBuilds:
+  '@modelcontextprotocol/ext-apps': true
+  electron: true
+  electron-winstaller: true
+  esbuild: true

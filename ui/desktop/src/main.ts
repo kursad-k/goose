@@ -968,6 +968,25 @@ const appWindows = new Map<string, BrowserWindow>();
 
 const gooseServeLeases = new GooseServeLeaseRegistry(log);
 
+// Guarantee backend processes die with the app on every exit path. Electron
+// doesn't await the async `will-quit` cleanup, and terminal SIGINT/SIGTERM
+// never fire it at all — so synchronously force-kill tracked backends here.
+let backendsKilled = false;
+const killBackends = () => {
+  if (backendsKilled) return;
+  backendsKilled = true;
+  gooseServeLeases.killAllSync();
+};
+process.on('exit', killBackends);
+process.on('SIGINT', () => {
+  killBackends();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  killBackends();
+  process.exit(143);
+});
+
 const windowPowerSaveBlockers = new Map<number, number>(); // windowId -> blockerId
 // Track pending initial messages per window
 const pendingInitialMessages = new Map<number, string>(); // windowId -> initialMessage
@@ -3108,6 +3127,9 @@ async function getAllowList(): Promise<string[]> {
 }
 
 app.on('will-quit', async () => {
+  // Synchronous guarantee first — Electron won't await the async cleanup below.
+  killBackends();
+
   const gooseServeLeaseCount = gooseServeLeases.activeLeaseCount();
   if (gooseServeLeaseCount > 0) {
     log.info(`App quitting, cleaning up ${gooseServeLeaseCount} backend lease(s)`);

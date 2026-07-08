@@ -191,14 +191,20 @@ fn drain_console_paste(_first: char) -> String {
     String::new()
 }
 
-/// Distinguish a genuine multi-line paste from fast type-ahead. rustyline reads
-/// one event at a time, so the rest of the burst is still queued; we *peek* it
-/// (without consuming) and treat it as a paste only when a newline is followed
-/// by more input. A single typed line terminated by Enter has its newline last,
-/// so it is not a paste and must still submit normally. A burst too large to
-/// scan is unambiguously a paste. Always `false` off Windows.
+/// A non-destructive look at the characters queued behind the current event.
 #[cfg(windows)]
-fn console_burst_is_paste() -> bool {
+enum PeekedBurst {
+    /// Larger than we bother to scan — unambiguously a paste.
+    TooLarge,
+    /// The key-down characters currently queued (key-up and non-key records,
+    /// which rustyline discards, are omitted). May be empty.
+    Chars(Vec<u16>),
+}
+
+/// Peek the queued console input without consuming it. rustyline reads one event
+/// at a time, so the remainder of a paste burst is still buffered here.
+#[cfg(windows)]
+fn peek_pending_chars() -> Option<PeekedBurst> {
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::STD_INPUT_HANDLE;
     use winapi::um::wincon::{PeekConsoleInputW, INPUT_RECORD, KEY_EVENT};
@@ -206,10 +212,10 @@ fn console_burst_is_paste() -> bool {
     const PEEK_CAP: u32 = 512;
     let pending = console_pending_events();
     if pending == 0 {
-        return false;
+        return None;
     }
     if pending > PEEK_CAP {
-        return true;
+        return Some(PeekedBurst::TooLarge);
     }
 
     unsafe {
@@ -217,7 +223,7 @@ fn console_burst_is_paste() -> bool {
         let mut records: Vec<INPUT_RECORD> = vec![std::mem::zeroed(); pending as usize];
         let mut read: u32 = 0;
         if PeekConsoleInputW(handle, records.as_mut_ptr(), pending, &mut read) == 0 {
-            return false;
+            return None;
         }
 
         let mut chars: Vec<u16> = Vec::new();
@@ -232,11 +238,37 @@ fn console_burst_is_paste() -> bool {
                 }
             }
         }
+        Some(PeekedBurst::Chars(chars))
+    }
+}
 
-        chars
+/// Distinguish a genuine multi-line paste from fast type-ahead. We treat the
+/// queued burst as a paste only when a newline is followed by more input. A
+/// single typed line terminated by Enter has its newline last, so it is not a
+/// paste and must still submit normally. A burst too large to scan is
+/// unambiguously a paste. Always `false` off Windows.
+#[cfg(windows)]
+fn console_burst_is_paste() -> bool {
+    match peek_pending_chars() {
+        None => false,
+        Some(PeekedBurst::TooLarge) => true,
+        Some(PeekedBurst::Chars(chars)) => chars
             .iter()
             .enumerate()
-            .any(|(i, &c)| (c == 0x0D || c == 0x0A) && i + 1 < chars.len())
+            .any(|(i, &c)| (c == 0x0D || c == 0x0A) && i + 1 < chars.len()),
+    }
+}
+
+/// Whether any printable character is queued behind the current event. Used for
+/// a paste that begins with a newline: the leading newline arrives as the Enter
+/// event and is consumed before we peek, so the "more input after the newline"
+/// that marks a paste is whatever remains queued. Always `false` off Windows.
+#[cfg(windows)]
+fn console_has_pending_char() -> bool {
+    match peek_pending_chars() {
+        None => false,
+        Some(PeekedBurst::TooLarge) => true,
+        Some(PeekedBurst::Chars(chars)) => !chars.is_empty(),
     }
 }
 
@@ -245,16 +277,30 @@ fn console_burst_is_paste() -> bool {
     false
 }
 
+#[cfg(not(windows))]
+fn console_has_pending_char() -> bool {
+    false
+}
+
 /// If `first` begins a multi-line paste burst, capture the whole burst and
 /// return the command that renders it — a `[Pasted N lines]` chip, or the literal
 /// text when it is too small to collapse. Returns `None` for ordinary keystrokes
 /// and type-ahead (and always off Windows, where rustyline handles pastes via
-/// bracketed paste).
+/// bracketed paste). When `first` is itself the newline (the Enter path), it is
+/// the paste's leading newline, so any queued printable text makes it a paste.
 fn capture_paste(
     state: &Arc<std::sync::RwLock<PasteState>>,
     first: char,
 ) -> Option<rustyline::Cmd> {
-    if console_pending_events() < PASTE_QUEUE_THRESHOLD || !console_burst_is_paste() {
+    if console_pending_events() < PASTE_QUEUE_THRESHOLD {
+        return None;
+    }
+    let is_paste = if first == '\n' || first == '\r' {
+        console_has_pending_char()
+    } else {
+        console_burst_is_paste()
+    };
+    if !is_paste {
         return None;
     }
 
@@ -393,9 +439,10 @@ fn expand_pastes(line: &str, pastes: &[Paste]) -> String {
         .filter_map(|paste| rest.find(&paste.marker).map(|idx| (idx, paste)))
         .min_by_key(|(idx, _)| *idx)
     {
-        result.push_str(&rest[..idx]);
+        let (before, after) = rest.split_at(idx);
+        result.push_str(before);
         result.push_str(&paste.content);
-        rest = &rest[idx + paste.marker.len()..];
+        rest = after.strip_prefix(paste.marker.as_str()).unwrap_or(after);
     }
     result.push_str(rest);
     result

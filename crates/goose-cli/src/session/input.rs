@@ -372,8 +372,10 @@ fn paste_marker(content: &str, id: usize) -> Option<String> {
     }
 }
 
-/// Expand chip markers in the submitted line back to their pasted content,
-/// left to right, so `> summarize [Pasted 50 lines]` submits the full text.
+/// Expand chip markers in the submitted line back to their pasted content, in
+/// the order the chips appear in the line, so `> summarize [Pasted 50 lines]`
+/// submits the full text. Chips are matched by position rather than by capture
+/// order, so reordering them in the prompt still expands every block.
 fn expand_pastes(line: &str, pastes: &[Paste]) -> String {
     if pastes.is_empty() {
         return line.to_string();
@@ -381,12 +383,14 @@ fn expand_pastes(line: &str, pastes: &[Paste]) -> String {
 
     let mut result = String::with_capacity(line.len());
     let mut rest = line;
-    for paste in pastes {
-        if let Some(idx) = rest.find(&paste.marker) {
-            result.push_str(&rest[..idx]);
-            result.push_str(&paste.content);
-            rest = &rest[idx + paste.marker.len()..];
-        }
+    while let Some((idx, paste)) = pastes
+        .iter()
+        .filter_map(|paste| rest.find(&paste.marker).map(|idx| (idx, paste)))
+        .min_by_key(|(idx, _)| *idx)
+    {
+        result.push_str(&rest[..idx]);
+        result.push_str(&paste.content);
+        rest = &rest[idx + paste.marker.len()..];
     }
     result.push_str(rest);
     result
@@ -865,6 +869,26 @@ mod tests {
         assert_eq!(
             expand_pastes("[Pasted 2 lines #1] and [Pasted 3 lines #2]", &pastes),
             "FIRST and SECOND"
+        );
+    }
+
+    #[test]
+    fn test_expand_pastes_reordered() {
+        // The chips are moved so a later paste appears before an earlier one.
+        // Matching by position (not capture order) still expands both.
+        let pastes = vec![
+            Paste {
+                marker: "[Pasted 2 lines #1]".to_string(),
+                content: "FIRST".to_string(),
+            },
+            Paste {
+                marker: "[Pasted 3 lines #2]".to_string(),
+                content: "SECOND".to_string(),
+            },
+        ];
+        assert_eq!(
+            expand_pastes("[Pasted 3 lines #2] then [Pasted 2 lines #1]", &pastes),
+            "SECOND then FIRST"
         );
     }
 

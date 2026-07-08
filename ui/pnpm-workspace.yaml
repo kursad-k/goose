@@ -3,6 +3,9 @@ packages:
   - 'text'
   - 'desktop'
   - 'goose-binary/*'
+overrides:
+  react: ^19.2.4
+  react-dom: ^19.2.4
 nodeLinker: hoisted
 allowBuilds:
   '@modelcontextprotocol/ext-apps': true

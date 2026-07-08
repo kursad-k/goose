@@ -4334,6 +4334,9 @@
   "telemetrySettings.updateError": {
     "defaultMessage": "Échec de la mise à jour des paramètres de télémétrie."
   },
+  "themeSelector.aura": {
+    "defaultMessage": "Aura"
+  },
   "themeSelector.dark": {
     "defaultMessage": "Sombre"
   },

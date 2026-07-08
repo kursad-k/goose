@@ -44,6 +44,25 @@ pub struct PlanCommandOptions {
     pub message_text: String,
 }
 
+/// Minimum number of events already queued in the console input buffer for a
+/// keystroke to be treated as the start of a paste rather than fast typing /
+/// type-ahead. A single keypress leaves at most its own key-up event queued.
+const PASTE_QUEUE_THRESHOLD: u32 = 2;
+/// Collapse a paste into a chip once it spans at least this many lines.
+const PASTE_CHIP_MIN_LINES: usize = 2;
+/// ...or once a single-line paste is at least this many characters.
+const PASTE_CHIP_MIN_CHARS: usize = 400;
+
+struct Paste {
+    marker: String,
+    content: String,
+}
+
+#[derive(Default)]
+struct PasteState {
+    pastes: Vec<Paste>,
+}
+
 struct CtrlCHandler {
     completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
 }
@@ -83,12 +102,183 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
     }
 }
 
+/// Number of events still queued in the console input buffer, i.e. keystrokes
+/// the terminal has delivered but rustyline has not yet read. During a paste the
+/// whole payload is queued at once, so a non-empty queue right after a keystroke
+/// reliably distinguishes pasted input from real typing. Always 0 off Windows,
+/// where rustyline handles pastes natively via bracketed paste.
+#[cfg(windows)]
+fn console_pending_events() -> u32 {
+    use winapi::um::consoleapi::GetNumberOfConsoleInputEvents;
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_INPUT_HANDLE;
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut count: u32 = 0;
+        if GetNumberOfConsoleInputEvents(handle, &mut count) != 0 {
+            count
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn console_pending_events() -> u32 {
+    0
+}
+
+/// Drain the remainder of a paste burst directly from the console input buffer,
+/// starting from `first` (the character that triggered detection). rustyline
+/// reads events one at a time, so the rest of the payload is still queued here;
+/// consuming it ourselves keeps it from being echoed line by line and lets us
+/// finalize the chip in a single keystroke. Key-up and non-key records — which
+/// rustyline discards but [`console_pending_events`] counts — are skipped.
+#[cfg(windows)]
+fn drain_console_paste(first: char) -> String {
+    use winapi::um::consoleapi::ReadConsoleInputW;
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_INPUT_HANDLE;
+    use winapi::um::wincon::{INPUT_RECORD, KEY_EVENT};
+
+    let mut units: Vec<u16> = Vec::new();
+    let mut buf = [0u16; 2];
+    units.extend_from_slice(first.encode_utf16(&mut buf));
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        loop {
+            if console_pending_events() == 0 {
+                // The queue can briefly empty between chunks of a large paste;
+                // poll a little before concluding the burst is over.
+                let mut more = false;
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    if console_pending_events() > 0 {
+                        more = true;
+                        break;
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut read: u32 = 0;
+            if ReadConsoleInputW(handle, &mut record, 1, &mut read) == 0 || read == 0 {
+                break;
+            }
+            if record.EventType == KEY_EVENT {
+                let key = record.Event.KeyEvent();
+                if key.bKeyDown != 0 {
+                    let ch = *key.uChar.UnicodeChar();
+                    if ch != 0 {
+                        units.push(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    normalize_paste_text(&String::from_utf16_lossy(&units))
+}
+
+#[cfg(not(windows))]
+fn drain_console_paste(_first: char) -> String {
+    String::new()
+}
+
+/// If `first` begins a paste burst, capture the whole burst and return the
+/// command that renders it — a `[Pasted N lines]` chip, or the literal text when
+/// it is too small to collapse. Returns `None` for ordinary keystrokes (and
+/// always off Windows, where rustyline handles pastes via bracketed paste).
+fn capture_paste(state: &Arc<std::sync::RwLock<PasteState>>, first: char) -> Option<rustyline::Cmd> {
+    if console_pending_events() < PASTE_QUEUE_THRESHOLD {
+        return None;
+    }
+
+    let content = drain_console_paste(first);
+    let mut state = state.write().ok()?;
+    Some(match paste_marker(&content) {
+        Some(marker) => {
+            let cmd = rustyline::Cmd::Insert(1, marker.clone());
+            state.pastes.push(Paste { marker, content });
+            cmd
+        }
+        None => rustyline::Cmd::Insert(1, content),
+    })
+}
+
+/// Intercepts printable characters so a pasted burst is captured into
+/// [`PasteState`] instead of being echoed line by line.
+struct PasteCaptureHandler {
+    paste_state: Arc<std::sync::RwLock<PasteState>>,
+}
+
+impl PasteCaptureHandler {
+    fn new(paste_state: Arc<std::sync::RwLock<PasteState>>) -> Self {
+        Self { paste_state }
+    }
+}
+
+impl rustyline::ConditionalEventHandler for PasteCaptureHandler {
+    fn handle(
+        &self,
+        event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        let ch = match event.get(0)? {
+            rustyline::KeyEvent(rustyline::KeyCode::Char(c), m)
+                if *m == rustyline::Modifiers::NONE || *m == rustyline::Modifiers::SHIFT =>
+            {
+                *c
+            }
+            _ => return None,
+        };
+        capture_paste(&self.paste_state, ch)
+    }
+}
+
+/// Handles Enter: a newline that begins a paste burst is folded into the pasted
+/// block; a genuine keystroke accepts the line.
+struct PasteAwareEnterHandler {
+    paste_state: Arc<std::sync::RwLock<PasteState>>,
+}
+
+impl PasteAwareEnterHandler {
+    fn new(paste_state: Arc<std::sync::RwLock<PasteState>>) -> Self {
+        Self { paste_state }
+    }
+}
+
+impl rustyline::ConditionalEventHandler for PasteAwareEnterHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        Some(capture_paste(&self.paste_state, '\n').unwrap_or(rustyline::Cmd::AcceptLine))
+    }
+}
+
+/// The Ctrl-modified character that inserts a newline instead of submitting the
+/// prompt. Configurable via `GOOSE_CLI_NEWLINE_KEY`, defaulting to `j` (Ctrl+J).
+/// Characters already bound to other actions are rejected: `m` (Ctrl+M is Enter)
+/// and `c` (Ctrl+C interrupts), both of which would otherwise shadow the paste
+/// and interrupt handlers.
 pub fn get_newline_key() -> char {
     Config::global()
         .get_param::<String>("GOOSE_CLI_NEWLINE_KEY")
         .ok()
         .and_then(|s| s.chars().next())
         .map(|c| c.to_ascii_lowercase())
+        .filter(|c| !matches!(c, 'm' | 'c'))
         .unwrap_or('j')
 }
 
@@ -103,6 +293,56 @@ fn should_use_editor_always(
 ) -> bool {
     let has_editor = prompt_editor.map(|s| !s.is_empty()).unwrap_or(false);
     editor_always_override.unwrap_or(has_editor)
+}
+
+fn normalize_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Build the chip shown in place of a pasted block, or `None` when the paste is
+/// small enough to keep inline.
+fn paste_marker(content: &str) -> Option<String> {
+    let lines = content.trim_end_matches('\n').matches('\n').count() + 1;
+    if lines >= PASTE_CHIP_MIN_LINES {
+        Some(format!("[Pasted {lines} lines]"))
+    } else if content.chars().count() >= PASTE_CHIP_MIN_CHARS {
+        Some(format!("[Pasted {} chars]", content.chars().count()))
+    } else {
+        None
+    }
+}
+
+/// Expand chip markers in the submitted line back to their pasted content,
+/// left to right, so `> summarize [Pasted 50 lines]` submits the full text.
+fn expand_pastes(line: &str, pastes: &[Paste]) -> String {
+    if pastes.is_empty() {
+        return line.to_string();
+    }
+
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    for paste in pastes {
+        if let Some(idx) = rest.find(&paste.marker) {
+            result.push_str(&rest[..idx]);
+            result.push_str(&paste.content);
+            rest = &rest[idx + paste.marker.len()..];
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+fn read_paste_aware_input(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    paste_state: Arc<std::sync::RwLock<PasteState>>,
+) -> rustyline::Result<String> {
+    let input = editor.readline("> ")?;
+    let expanded = paste_state
+        .read()
+        .ok()
+        .map(|state| expand_pastes(&input, &state.pastes))
+        .unwrap_or(input);
+    Ok(expanded)
 }
 
 pub fn get_input(
@@ -136,10 +376,32 @@ pub fn get_input(
         .map(|h| h.completion_cache.clone())
         .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
 
-    let newline_key = get_newline_key();
+    let paste_state = Arc::new(std::sync::RwLock::new(PasteState::default()));
+
+    editor.bind_sequence(
+        rustyline::Event::Any,
+        rustyline::EventHandler::Conditional(Box::new(PasteCaptureHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(PasteAwareEnterHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('m'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(PasteAwareEnterHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
     editor.bind_sequence(
         rustyline::KeyEvent(
-            rustyline::KeyCode::Char(newline_key),
+            rustyline::KeyCode::Char(get_newline_key()),
             rustyline::Modifiers::CTRL,
         ),
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
@@ -150,7 +412,7 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let input = match editor.readline("> ") {
+    let input = match read_paste_aware_input(editor, paste_state) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -402,8 +664,8 @@ fn parse_plan_command(input: String) -> Option<InputResult> {
 }
 
 fn help_text() -> String {
-    let newline_key = get_newline_key().to_ascii_uppercase();
     let modes = GooseMode::VARIANTS.join(", ");
+    let newline_key = get_newline_key().to_ascii_uppercase();
     let additional_builtin_help = additional_builtin_help();
     let additional_builtin_help = if additional_builtin_help.is_empty() {
         String::new()
@@ -440,8 +702,9 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 
 Navigation:
-Ctrl+C - Clear current line if text is entered, otherwise exit the session
+Enter - Send message
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
+Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up/Down arrows - Navigate through command history"
     )
 }
@@ -490,6 +753,69 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paste_marker() {
+        assert_eq!(paste_marker("single line"), None);
+        assert_eq!(
+            paste_marker("line one\nline two"),
+            Some("[Pasted 2 lines]".to_string())
+        );
+        // Trailing newline is not counted as an extra line.
+        assert_eq!(
+            paste_marker("line one\nline two\n"),
+            Some("[Pasted 2 lines]".to_string())
+        );
+        let long = "x".repeat(PASTE_CHIP_MIN_CHARS);
+        assert_eq!(
+            paste_marker(&long),
+            Some(format!("[Pasted {PASTE_CHIP_MIN_CHARS} chars]"))
+        );
+    }
+
+    #[test]
+    fn test_expand_pastes() {
+        assert_eq!(expand_pastes("no chips here", &[]), "no chips here");
+
+        let pastes = vec![Paste {
+            marker: "[Pasted 2 lines]".to_string(),
+            content: "a\nb".to_string(),
+        }];
+        assert_eq!(
+            expand_pastes("summarize [Pasted 2 lines] please", &pastes),
+            "summarize a\nb please"
+        );
+
+        // Deleting the chip drops its content rather than corrupting the message.
+        assert_eq!(expand_pastes("summarize please", &pastes), "summarize please");
+    }
+
+    #[test]
+    fn test_expand_pastes_multiple_in_order() {
+        let pastes = vec![
+            Paste {
+                marker: "[Pasted 2 lines]".to_string(),
+                content: "FIRST".to_string(),
+            },
+            Paste {
+                marker: "[Pasted 2 lines]".to_string(),
+                content: "SECOND".to_string(),
+            },
+        ];
+        assert_eq!(
+            expand_pastes("[Pasted 2 lines] and [Pasted 2 lines]", &pastes),
+            "FIRST and SECOND"
+        );
+    }
+
+    #[test]
+    fn test_capture_paste_ignored_without_burst() {
+        // Off Windows (and on Windows with no queued burst) there is nothing to
+        // drain, so ordinary keystrokes are never captured as a paste.
+        let state = Arc::new(std::sync::RwLock::new(PasteState::default()));
+        assert!(capture_paste(&state, 'a').is_none());
+        assert!(state.read().unwrap().pastes.is_empty());
+    }
 
     #[test]
     fn test_handle_slash_command() {

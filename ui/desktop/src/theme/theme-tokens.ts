@@ -329,20 +329,24 @@ const HOST_FONT_CSS = `
 
 /**
  * Build the McpUiHostStyles object for MCP apps.
- * Color keys use light-dark() so a single payload works for both themes.
- * Non-color keys (fonts, radii, shadows) use plain values from baseTokens
- * (or light as the default when values differ, e.g. shadows).
+ *
+ * For the built-in light/dark pair, color keys use light-dark() so a single
+ * payload resolves correctly against the guest's color-scheme. Custom themes
+ * (e.g. aura) share a variant with dark but carry their own palette and fonts,
+ * so light-dark() can't express them — emit that theme's concrete token values
+ * instead. Non-color keys always use the theme's own values so overrides like
+ * Aura's monospace font family reach the guest.
  * css.fonts provides @font-face rules so sandboxed apps can load host fonts.
  */
-export function buildMcpHostStyles(): McpUiHostStyles {
+export function buildMcpHostStyles(themeId: ThemeId = 'light'): McpUiHostStyles {
+  const tokens = (themes[themeId] ?? themes.light).tokens;
+  const isBuiltinVariant = themeId === 'light' || themeId === 'dark';
   const variables: McpUiStyles = {} as McpUiStyles;
   for (const key of Object.keys(lightTokens) as McpUiStyleVariableKey[]) {
-    const light = lightTokens[key];
-    const dark = darkTokens[key];
-    if (key.startsWith('--color-')) {
-      variables[key] = `light-dark(${light}, ${dark})`;
+    if (key.startsWith('--color-') && isBuiltinVariant) {
+      variables[key] = `light-dark(${lightTokens[key]}, ${darkTokens[key]})`;
     } else {
-      variables[key] = light;
+      variables[key] = tokens[key];
     }
   }
   return { variables, css: { fonts: HOST_FONT_CSS } };

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useMemo } from 'react';
 import { applyThemeTokens, buildMcpHostStyles, themes } from '../theme/theme-tokens';
 import type { ThemeId, ThemeVariant } from '../theme/theme-tokens';
 import type { McpUiHostStyles } from '@modelcontextprotocol/ext-apps/app-bridge';
@@ -36,9 +36,6 @@ function applyThemeToDocument(theme: ResolvedTheme): void {
   document.documentElement.style.colorScheme = theme;
 }
 
-// Built once — light-dark() values are theme-independent
-const mcpHostStyles = buildMcpHostStyles();
-
 interface ThemeProviderProps {
   children: React.ReactNode;
 }
@@ -48,6 +45,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   const [userThemePreference, setUserThemePreferenceState] = useState<ThemePreference>('light');
   const [resolvedThemeId, setResolvedThemeId] = useState<ThemeId>('light');
   const resolvedTheme = themes[resolvedThemeId].variant;
+  const mcpHostStyles = useMemo(() => buildMcpHostStyles(resolvedThemeId), [resolvedThemeId]);
 
   useEffect(() => {
     async function loadThemeFromSettings() {

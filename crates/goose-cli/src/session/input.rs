@@ -250,7 +250,10 @@ fn console_burst_is_paste() -> bool {
 /// text when it is too small to collapse. Returns `None` for ordinary keystrokes
 /// and type-ahead (and always off Windows, where rustyline handles pastes via
 /// bracketed paste).
-fn capture_paste(state: &Arc<std::sync::RwLock<PasteState>>, first: char) -> Option<rustyline::Cmd> {
+fn capture_paste(
+    state: &Arc<std::sync::RwLock<PasteState>>,
+    first: char,
+) -> Option<rustyline::Cmd> {
     if console_pending_events() < PASTE_QUEUE_THRESHOLD || !console_burst_is_paste() {
         return None;
     }
@@ -354,6 +357,7 @@ fn should_use_editor_always(
     editor_always_override.unwrap_or(has_editor)
 }
 
+#[cfg(windows)]
 fn normalize_paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -852,7 +856,10 @@ mod tests {
         );
 
         // Deleting the chip drops its content rather than corrupting the message.
-        assert_eq!(expand_pastes("summarize please", &pastes), "summarize please");
+        assert_eq!(
+            expand_pastes("summarize please", &pastes),
+            "summarize please"
+        );
     }
 
     #[test]

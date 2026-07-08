@@ -295,6 +295,7 @@ impl rustyline::ConditionalEventHandler for PasteCaptureHandler {
             {
                 *c
             }
+            rustyline::KeyEvent(rustyline::KeyCode::Tab, rustyline::Modifiers::NONE) => '\t',
             _ => return None,
         };
         capture_paste(&self.paste_state, ch)

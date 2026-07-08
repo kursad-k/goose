@@ -61,6 +61,7 @@ struct Paste {
 #[derive(Default)]
 struct PasteState {
     pastes: Vec<Paste>,
+    next_id: usize,
 }
 
 struct CtrlCHandler {
@@ -190,19 +191,76 @@ fn drain_console_paste(_first: char) -> String {
     String::new()
 }
 
-/// If `first` begins a paste burst, capture the whole burst and return the
-/// command that renders it — a `[Pasted N lines]` chip, or the literal text when
-/// it is too small to collapse. Returns `None` for ordinary keystrokes (and
-/// always off Windows, where rustyline handles pastes via bracketed paste).
+/// Distinguish a genuine multi-line paste from fast type-ahead. rustyline reads
+/// one event at a time, so the rest of the burst is still queued; we *peek* it
+/// (without consuming) and treat it as a paste only when a newline is followed
+/// by more input. A single typed line terminated by Enter has its newline last,
+/// so it is not a paste and must still submit normally. A burst too large to
+/// scan is unambiguously a paste. Always `false` off Windows.
+#[cfg(windows)]
+fn console_burst_is_paste() -> bool {
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_INPUT_HANDLE;
+    use winapi::um::wincon::{PeekConsoleInputW, INPUT_RECORD, KEY_EVENT};
+
+    const PEEK_CAP: u32 = 512;
+    let pending = console_pending_events();
+    if pending == 0 {
+        return false;
+    }
+    if pending > PEEK_CAP {
+        return true;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut records: Vec<INPUT_RECORD> = vec![std::mem::zeroed(); pending as usize];
+        let mut read: u32 = 0;
+        if PeekConsoleInputW(handle, records.as_mut_ptr(), pending, &mut read) == 0 {
+            return false;
+        }
+
+        let mut chars: Vec<u16> = Vec::new();
+        for record in records.iter().take(read as usize) {
+            if record.EventType == KEY_EVENT {
+                let key = record.Event.KeyEvent();
+                if key.bKeyDown != 0 {
+                    let ch = *key.uChar.UnicodeChar();
+                    if ch != 0 {
+                        chars.push(ch);
+                    }
+                }
+            }
+        }
+
+        chars
+            .iter()
+            .enumerate()
+            .any(|(i, &c)| (c == 0x0D || c == 0x0A) && i + 1 < chars.len())
+    }
+}
+
+#[cfg(not(windows))]
+fn console_burst_is_paste() -> bool {
+    false
+}
+
+/// If `first` begins a multi-line paste burst, capture the whole burst and
+/// return the command that renders it — a `[Pasted N lines]` chip, or the literal
+/// text when it is too small to collapse. Returns `None` for ordinary keystrokes
+/// and type-ahead (and always off Windows, where rustyline handles pastes via
+/// bracketed paste).
 fn capture_paste(state: &Arc<std::sync::RwLock<PasteState>>, first: char) -> Option<rustyline::Cmd> {
-    if console_pending_events() < PASTE_QUEUE_THRESHOLD {
+    if console_pending_events() < PASTE_QUEUE_THRESHOLD || !console_burst_is_paste() {
         return None;
     }
 
     let content = drain_console_paste(first);
     let mut state = state.write().ok()?;
-    Some(match paste_marker(&content) {
+    let id = state.next_id + 1;
+    Some(match paste_marker(&content, id) {
         Some(marker) => {
+            state.next_id = id;
             let cmd = rustyline::Cmd::Insert(1, marker.clone());
             state.pastes.push(Paste { marker, content });
             cmd
@@ -300,13 +358,15 @@ fn normalize_paste_text(text: &str) -> String {
 }
 
 /// Build the chip shown in place of a pasted block, or `None` when the paste is
-/// small enough to keep inline.
-fn paste_marker(content: &str) -> Option<String> {
+/// small enough to keep inline. `id` makes the marker unique to this paste
+/// instance so a cleared chip can never be expanded into a later, identical-
+/// looking one (see [`expand_pastes`]).
+fn paste_marker(content: &str, id: usize) -> Option<String> {
     let lines = content.trim_end_matches('\n').matches('\n').count() + 1;
     if lines >= PASTE_CHIP_MIN_LINES {
-        Some(format!("[Pasted {lines} lines]"))
+        Some(format!("[Pasted {lines} lines #{id}]"))
     } else if content.chars().count() >= PASTE_CHIP_MIN_CHARS {
-        Some(format!("[Pasted {} chars]", content.chars().count()))
+        Some(format!("[Pasted {} chars #{id}]", content.chars().count()))
     } else {
         None
     }
@@ -756,20 +816,20 @@ mod tests {
 
     #[test]
     fn test_paste_marker() {
-        assert_eq!(paste_marker("single line"), None);
+        assert_eq!(paste_marker("single line", 1), None);
         assert_eq!(
-            paste_marker("line one\nline two"),
-            Some("[Pasted 2 lines]".to_string())
+            paste_marker("line one\nline two", 1),
+            Some("[Pasted 2 lines #1]".to_string())
         );
         // Trailing newline is not counted as an extra line.
         assert_eq!(
-            paste_marker("line one\nline two\n"),
-            Some("[Pasted 2 lines]".to_string())
+            paste_marker("line one\nline two\n", 2),
+            Some("[Pasted 2 lines #2]".to_string())
         );
         let long = "x".repeat(PASTE_CHIP_MIN_CHARS);
         assert_eq!(
-            paste_marker(&long),
-            Some(format!("[Pasted {PASTE_CHIP_MIN_CHARS} chars]"))
+            paste_marker(&long, 3),
+            Some(format!("[Pasted {PASTE_CHIP_MIN_CHARS} chars #3]"))
         );
     }
 
@@ -778,11 +838,11 @@ mod tests {
         assert_eq!(expand_pastes("no chips here", &[]), "no chips here");
 
         let pastes = vec![Paste {
-            marker: "[Pasted 2 lines]".to_string(),
+            marker: "[Pasted 2 lines #1]".to_string(),
             content: "a\nb".to_string(),
         }];
         assert_eq!(
-            expand_pastes("summarize [Pasted 2 lines] please", &pastes),
+            expand_pastes("summarize [Pasted 2 lines #1] please", &pastes),
             "summarize a\nb please"
         );
 
@@ -794,18 +854,36 @@ mod tests {
     fn test_expand_pastes_multiple_in_order() {
         let pastes = vec![
             Paste {
-                marker: "[Pasted 2 lines]".to_string(),
+                marker: "[Pasted 2 lines #1]".to_string(),
                 content: "FIRST".to_string(),
             },
             Paste {
-                marker: "[Pasted 2 lines]".to_string(),
+                marker: "[Pasted 3 lines #2]".to_string(),
                 content: "SECOND".to_string(),
             },
         ];
         assert_eq!(
-            expand_pastes("[Pasted 2 lines] and [Pasted 2 lines]", &pastes),
+            expand_pastes("[Pasted 2 lines #1] and [Pasted 3 lines #2]", &pastes),
             "FIRST and SECOND"
         );
+    }
+
+    #[test]
+    fn test_expand_pastes_skips_cleared_paste() {
+        // A paste was made, cleared (Ctrl+C), then another paste with the same
+        // line count was made. Unique ids keep the stale entry from hijacking the
+        // visible chip: only the paste actually shown is expanded.
+        let pastes = vec![
+            Paste {
+                marker: "[Pasted 2 lines #1]".to_string(),
+                content: "CLEARED".to_string(),
+            },
+            Paste {
+                marker: "[Pasted 2 lines #2]".to_string(),
+                content: "CURRENT".to_string(),
+            },
+        ];
+        assert_eq!(expand_pastes("[Pasted 2 lines #2]", &pastes), "CURRENT");
     }
 
     #[test]

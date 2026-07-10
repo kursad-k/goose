@@ -968,9 +968,10 @@ const appWindows = new Map<string, BrowserWindow>();
 
 const gooseServeLeases = new GooseServeLeaseRegistry(log);
 
-// Guarantee backend processes die with the app on every exit path. Electron
-// doesn't await the async `will-quit` cleanup, and terminal SIGINT/SIGTERM
-// never fire it at all — so synchronously force-kill tracked backends here.
+// Last-resort backend cleanup for exit paths where the async `will-quit`
+// cleanup can't run to completion: `process.exit` teardown and terminal
+// SIGINT/SIGTERM. On a normal quit the graceful cleanup in `will-quit` has
+// already reaped the backends, leaving nothing for this to kill.
 let backendsKilled = false;
 const killBackends = () => {
   if (backendsKilled) return;
@@ -3127,9 +3128,6 @@ async function getAllowList(): Promise<string[]> {
 }
 
 app.on('will-quit', async () => {
-  // Synchronous guarantee first — Electron won't await the async cleanup below.
-  killBackends();
-
   const gooseServeLeaseCount = gooseServeLeases.activeLeaseCount();
   if (gooseServeLeaseCount > 0) {
     log.info(`App quitting, cleaning up ${gooseServeLeaseCount} backend lease(s)`);

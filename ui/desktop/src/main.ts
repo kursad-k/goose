@@ -968,6 +968,26 @@ const appWindows = new Map<string, BrowserWindow>();
 
 const gooseServeLeases = new GooseServeLeaseRegistry(log);
 
+// Last-resort backend cleanup for exit paths where the async `will-quit`
+// cleanup can't run to completion: `process.exit` teardown and terminal
+// SIGINT/SIGTERM. On a normal quit the graceful cleanup in `will-quit` has
+// already reaped the backends, leaving nothing for this to kill.
+let backendsKilled = false;
+const killBackends = () => {
+  if (backendsKilled) return;
+  backendsKilled = true;
+  gooseServeLeases.killAllSync();
+};
+process.on('exit', killBackends);
+process.on('SIGINT', () => {
+  killBackends();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  killBackends();
+  process.exit(143);
+});
+
 const windowPowerSaveBlockers = new Map<number, number>(); // windowId -> blockerId
 // Track pending initial messages per window
 const pendingInitialMessages = new Map<number, string>(); // windowId -> initialMessage

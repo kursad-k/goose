@@ -1,3 +1,4 @@
+import { spawnSync } from 'child_process';
 import type { GooseServeExitSignal, GooseServeResult, Logger } from './gooseServe';
 
 export const GOOSE_SERVE_EXITED_USER_MESSAGE =
@@ -16,6 +17,9 @@ export interface GooseServeLease {
 
 export class GooseServeLeaseRegistry {
   private leasesByWindowId = new Map<number, GooseServeLease>();
+  // PIDs of live backend processes, tracked for synchronous force-kill on
+  // abrupt exit (SIGINT/SIGTERM/exit) where async cleanup can't run.
+  private processPids = new Set<number>();
 
   constructor(private readonly logger: Logger) {}
 
@@ -58,7 +62,15 @@ export class GooseServeLeaseRegistry {
       }
     };
 
+    const pid = result.process.pid;
+    if (pid !== undefined) {
+      this.processPids.add(pid);
+    }
+
     result.process.once('exit', (code, signal) => {
+      if (pid !== undefined) {
+        this.processPids.delete(pid);
+      }
       markExited({ code, signal, logUnexpected: true });
     });
 
@@ -156,6 +168,24 @@ export class GooseServeLeaseRegistry {
 
   async cleanupAll() {
     await Promise.all(this.uniqueLeases().map((lease) => this.cleanupLease(lease)));
+  }
+
+  // Synchronously force-kill every live backend process. Safe to call from
+  // signal/exit handlers where async cleanup won't complete. Killing an
+  // already-dead pid is a harmless no-op.
+  killAllSync(): void {
+    for (const pid of this.processPids) {
+      try {
+        if (process.platform === 'win32') {
+          spawnSync('taskkill', ['/pid', String(pid), '/f', '/t']);
+        } else {
+          process.kill(pid, 'SIGKILL');
+        }
+      } catch (error) {
+        this.logger.error('Failed to force-kill goose serve process', { pid, error });
+      }
+    }
+    this.processPids.clear();
   }
 
   private uniqueLeases(): GooseServeLease[] {

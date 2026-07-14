@@ -161,6 +161,13 @@ fn fill_stream_timing(
     }
 }
 
+fn message_has_timing_content(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
+}
+
 impl Agent {
     pub async fn prepare_tools_and_prompt(
         &self,
@@ -191,7 +198,9 @@ impl Agent {
                         // from the standard tool list
                         if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
                             crate::agents::extension_manager::is_first_class_extension(&o)
-                        }) {
+                        }) || crate::agents::extension_manager::get_tool_resource_uri(&t)
+                            .is_some()
+                        {
                             Some(t)
                         } else {
                             None
@@ -345,7 +354,7 @@ impl Agent {
                     let (msg_opt, usage_opt) = result?;
 
                     if let Some(msg) = msg_opt {
-                        if first_content_at.is_none() {
+                        if first_content_at.is_none() && message_has_timing_content(&msg) {
                             first_content_at = Some(std::time::Instant::now());
                         }
                         accumulated_message = Some(match accumulated_message {
@@ -394,7 +403,9 @@ impl Agent {
                 while let Some(result) = stream.next().await {
                     let (message, mut usage) = result?;
 
-                    if message.is_some() && first_content_at.is_none() {
+                    if first_content_at.is_none()
+                        && message.as_ref().is_some_and(message_has_timing_content)
+                    {
                         first_content_at = Some(std::time::Instant::now());
                     }
                     if let Some(usage) = usage.as_mut() {
@@ -656,7 +667,7 @@ pub fn is_tool_visible_to_model(tool: &Tool) -> bool {
 mod tests {
     use super::*;
     use crate::config::GooseMode;
-    use crate::conversation::message::Message;
+    use crate::conversation::message::{Message, SystemNotificationType};
     use crate::providers::base::Provider;
     use crate::session::session_manager::SessionType;
     use async_trait::async_trait;
@@ -1034,6 +1045,27 @@ mod tests {
         let mut usage = ProviderUsage::new("mock".to_string(), Usage::default());
         usage.stats = stats;
         usage
+    }
+
+    #[test]
+    fn message_has_timing_content_ignores_system_notification_only_messages() {
+        let message = Message::assistant().with_system_notification(
+            SystemNotificationType::ProgressMessage,
+            "Loading local model test-model...",
+        );
+
+        assert!(!message_has_timing_content(&message));
+    }
+
+    #[test]
+    fn message_has_timing_content_counts_user_visible_messages() {
+        let text_message = Message::assistant().with_text("hello");
+        let mixed_message = Message::assistant()
+            .with_system_notification(SystemNotificationType::ProgressMessage, "Loading...")
+            .with_text("ready");
+
+        assert!(message_has_timing_content(&text_message));
+        assert!(message_has_timing_content(&mixed_message));
     }
 
     #[test]

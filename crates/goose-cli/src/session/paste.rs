@@ -59,6 +59,30 @@ fn console_pending_events() -> u32 {
     0
 }
 
+/// The Unicode code unit carried by a console key event, or `None` if the record
+/// carries no character. Characters normally arrive on key-down, but Unicode the
+/// active keyboard layout cannot synthesize — emoji, supplementary-plane chars —
+/// is injected by Windows as an Alt+numpad sequence whose composed character
+/// lands on the Alt (`VK_MENU`) key-up. Accepting that one key-up, and no other,
+/// mirrors rustyline's own console read loop and avoids double-counting the
+/// key-up of ordinary typed characters.
+#[cfg(windows)]
+fn key_event_char(record: &winapi::um::wincon::INPUT_RECORD) -> Option<u16> {
+    use winapi::um::wincon::KEY_EVENT;
+    const VK_MENU: u16 = 0x12;
+
+    if record.EventType != KEY_EVENT {
+        return None;
+    }
+    let key = unsafe { record.Event.KeyEvent() };
+    let ch = unsafe { *key.uChar.UnicodeChar() };
+    if ch != 0 && (key.bKeyDown != 0 || key.wVirtualKeyCode == VK_MENU) {
+        Some(ch)
+    } else {
+        None
+    }
+}
+
 /// Drain the remainder of a paste burst directly from the console input buffer,
 /// starting from `first` (the character that triggered detection). rustyline
 /// reads events one at a time, so the rest of the payload is still queued here;
@@ -70,7 +94,7 @@ fn drain_console_paste(first: char) -> String {
     use winapi::um::consoleapi::ReadConsoleInputW;
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::STD_INPUT_HANDLE;
-    use winapi::um::wincon::{INPUT_RECORD, KEY_EVENT};
+    use winapi::um::wincon::INPUT_RECORD;
 
     let mut units: Vec<u16> = Vec::new();
     let mut buf = [0u16; 2];
@@ -100,14 +124,8 @@ fn drain_console_paste(first: char) -> String {
             if ReadConsoleInputW(handle, &mut record, 1, &mut read) == 0 || read == 0 {
                 break;
             }
-            if record.EventType == KEY_EVENT {
-                let key = record.Event.KeyEvent();
-                if key.bKeyDown != 0 {
-                    let ch = *key.uChar.UnicodeChar();
-                    if ch != 0 {
-                        units.push(ch);
-                    }
-                }
+            if let Some(ch) = key_event_char(&record) {
+                units.push(ch);
             }
         }
     }
@@ -136,7 +154,7 @@ enum PeekedBurst {
 fn peek_pending_chars() -> Option<PeekedBurst> {
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::STD_INPUT_HANDLE;
-    use winapi::um::wincon::{PeekConsoleInputW, INPUT_RECORD, KEY_EVENT};
+    use winapi::um::wincon::{PeekConsoleInputW, INPUT_RECORD};
 
     const PEEK_CAP: u32 = 512;
     let pending = console_pending_events();
@@ -157,14 +175,8 @@ fn peek_pending_chars() -> Option<PeekedBurst> {
 
         let mut chars: Vec<u16> = Vec::new();
         for record in records.iter().take(read as usize) {
-            if record.EventType == KEY_EVENT {
-                let key = record.Event.KeyEvent();
-                if key.bKeyDown != 0 {
-                    let ch = *key.uChar.UnicodeChar();
-                    if ch != 0 {
-                        chars.push(ch);
-                    }
-                }
+            if let Some(ch) = key_event_char(record) {
+                chars.push(ch);
             }
         }
         Some(PeekedBurst::Chars(chars))

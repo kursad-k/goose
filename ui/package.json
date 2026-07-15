@@ -13,13 +13,5 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.1"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@modelcontextprotocol/ext-apps",
-      "electron",
-      "electron-winstaller",
-      "esbuild"
-    ]
   }
 }

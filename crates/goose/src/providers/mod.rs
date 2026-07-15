@@ -37,7 +37,10 @@ pub mod gcpvertexai;
 pub mod gemini_cli;
 pub mod gemini_oauth;
 pub mod githubcopilot;
-pub mod google;
+pub mod google {
+    pub use goose_providers::google::*;
+}
+pub mod google_def;
 pub mod http_status {
     pub use goose_providers::http_status::*;
 }
@@ -55,6 +58,7 @@ pub mod oauth_device_flow;
 pub mod ollama {
     pub use goose_providers::ollama::*;
 }
+pub mod ollama_cloud;
 pub mod ollama_def;
 pub mod openai {
     pub use goose_providers::openai::*;
